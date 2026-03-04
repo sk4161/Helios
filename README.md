@@ -57,7 +57,7 @@ or you can click <a href="https://github.com/PKU-YuanGroup/Helios-Page/blob/main
 
 * ⏳⏳⏳ Release the [Technical Report](https://github.com/PKU-YuanGroup/Helios-Page/blob/main/helios_technical_report.pdf) on arXiv.
 * `[2025.03.04]` 🚀 Day-0 support for [Ascend-NPU](https://www.hiascend.com)，with sincere gratitude to the Ascend Team for their support.
-* `[2025.03.04]` 🚀 Day-0 support for [Diffusers](https://github.com/huggingface/diffuser)，with special thanks to the HuggingFace Team for their support.
+* `[2025.03.04]` 🚀 Day-0 support for [Diffusers](https://github.com/huggingface/diffusers)，with special thanks to the HuggingFace Team for their support.
 * `[2025.03.04]` 🚀 Day-0 support for [vLLM-Omni](https://github.com/vllm-project/vllm-omni)，with heartfelt gratitude to the vLLM Team for their support.
 * `[2025.03.04]` 🚀 Day-0 support for [SGLang-Diffusion](https://github.com/sgl-project/sglang)，with huge thanks to the SGLang Team for their support.
 * `[2025.03.04]` 🔥 We've released the training/inference code and weights of **Helios-Base**, **Helios-Mid** and **Helios-Distilled**.
