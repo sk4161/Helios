@@ -418,7 +418,7 @@ If you find our paper and code useful in your research, please consider giving a
 
 ```BibTeX
 @article{helios,
-  title={Helios: Real-Time Long Video Generation without Anti-Drifting Strategies},
+  title={Helios: Real Real-Time Long Video Generation Model},
   author={Yuan, Shenghai and Yin, Yuanyang and Li, Zongjian and Huang, Xinwei and Yang, Xiao and Yuan, Li},
   journal={arXiv preprint arXiv:2603.xxxxx},
   year={2026}
