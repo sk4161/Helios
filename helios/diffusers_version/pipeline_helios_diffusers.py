@@ -491,9 +491,12 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         _, ph, pw = patch_size
         block_size = ph * pw
 
-        cov = torch.eye(block_size, device=device) * (1 + gamma) - torch.ones(block_size, block_size, device=device) * gamma
+        cov = (
+            torch.eye(block_size, device=device) * (1 + gamma)
+            - torch.ones(block_size, block_size, device=device) * gamma
+        )
         cov += torch.eye(block_size, device=device) * 1e-6
-        cov = cov.float()   # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
+        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
         L = torch.linalg.cholesky(cov)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
@@ -703,7 +706,9 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
                 batch_size, channel, num_frames, height, width = latents.shape
-                noise = self.sample_block_noise(batch_size, channel, num_frames, height, width, patch_size, device, generator)
+                noise = self.sample_block_noise(
+                    batch_size, channel, num_frames, height, width, patch_size, device, generator
+                )
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise  # To fix the block artifact
 

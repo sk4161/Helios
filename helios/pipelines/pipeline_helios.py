@@ -461,9 +461,12 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         _, ph, pw = patch_size
         block_size = ph * pw
 
-        cov = torch.eye(block_size, device=device) * (1 + gamma) - torch.ones(block_size, block_size, device=device) * gamma
+        cov = (
+            torch.eye(block_size, device=device) * (1 + gamma)
+            - torch.ones(block_size, block_size, device=device) * gamma
+        )
         cov += torch.eye(block_size, device=device) * 1e-6
-        cov = cov.float()   # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
+        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
         L = torch.linalg.cholesky(cov)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
@@ -631,6 +634,7 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         transformer_dtype: torch.dtype = None,
         scheduler_type: str = "unipc",  # unipc, euler
         use_dynamic_shifting: bool = False,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         # ------------ CFG Zero ------------
         use_cfg_zero_star: Optional[bool] = False,
         use_zero_init: Optional[bool] = True,
@@ -692,7 +696,16 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
                 batch_size, channel, num_frames, height, width = latents.shape
-                noise = self.sample_block_noise(batch_size, channel, num_frames, height, width, self.transformer.config.patch_size, device, generator)
+                noise = self.sample_block_noise(
+                    batch_size,
+                    channel,
+                    num_frames,
+                    height,
+                    width,
+                    self.transformer.config.patch_size,
+                    device,
+                    generator,
+                )
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise  # To fix the block artifact
 
@@ -1362,6 +1375,7 @@ class HeliosPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         transformer_dtype=transformer_dtype,
                         scheduler_type=scheduler_type,
                         use_dynamic_shifting=use_dynamic_shifting,
+                        generator=generator,
                         # ------------ CFG Zero ------------
                         use_cfg_zero_star=use_cfg_zero_star,
                         use_zero_init=use_zero_init,
