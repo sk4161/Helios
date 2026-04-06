@@ -1,10 +1,9 @@
-pip install -r requirements.txt
+uv sync
 
 rm -rf ~/.triton/cache/
 rm -rf /tmp/torchinductor_*
 
-pip uninstall triton torchao xformers wandb tensorflow tensorflow-cpu -y
-pip install wandb==0.23.0 triton==3.6.0
+uv remove torchao xformers tensorflow tensorflow-cpu 2>/dev/null || true
 
 rm -rf ~/.triton/cache/
 rm -rf /tmp/torchinductor_*
