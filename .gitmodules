@@ -4,3 +4,6 @@
 [submodule "MotionModes"]
 	path = MotionModes
 	url = https://github.com/adobe-research/MotionModes.git
+[submodule "group-inference"]
+	path = group-inference
+	url = https://github.com/GaParmar/group-inference.git
