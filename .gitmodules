@@ -1,3 +1,6 @@
 [submodule "memfof"]
 	path = memfof
 	url = https://github.com/msu-video-group/memfof.git
+[submodule "MotionModes"]
+	path = MotionModes
+	url = https://github.com/adobe-research/MotionModes.git
