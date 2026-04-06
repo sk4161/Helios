@@ -73,6 +73,7 @@ def parse_args():
         help="Data type for model weights.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for random number generator.")
+    parser.add_argument("--num_seeds", type=int, default=1, help="Number of seeds to run (0, 1, ..., num_seeds-1). Overrides --seed when > 1.")
     # base
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
@@ -502,56 +503,54 @@ def main():
             if not args.enable_parallelism or rank == 0:
                 export_to_video(output, output_path, fps=24)
     else:
-        with torch.no_grad():
-            # import time
-            # for _ in range(20):
-            #     start_time = time.time()
-            output = pipe(
-                prompt=prompt,
-                negative_prompt=args.negative_prompt,
-                height=args.height,
-                width=args.width,
-                num_frames=args.num_frames,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                generator=torch.Generator(device="cuda").manual_seed(args.seed),
-                # stage 1
-                history_sizes=[16, 2, 1],
-                num_latent_frames_per_chunk=args.num_latent_frames_per_chunk,
-                keep_first_frame=True,
-                # stage 2
-                is_enable_stage2=args.is_enable_stage2,
-                pyramid_num_inference_steps_list=args.pyramid_num_inference_steps_list,
-                # stage 3
-                is_skip_first_chunk=args.is_skip_first_chunk,
-                is_amplify_first_chunk=args.is_amplify_first_chunk,
-                # cfg zero
-                use_zero_init=args.use_zero_init,
-                zero_steps=args.zero_steps,
-                # i2v
-                image=load_image(image_path).resize((args.width, args.height)) if image_path is not None else None,
-                image_noise_sigma_min=args.image_noise_sigma_min,
-                image_noise_sigma_max=args.image_noise_sigma_max,
-                # v2v
-                video=load_video(video_path) if video_path is not None else None,
-                video_noise_sigma_min=args.video_noise_sigma_min,
-                video_noise_sigma_max=args.video_noise_sigma_max,
-                # interpolate_prompt
-                use_interpolate_prompt=args.use_interpolate_prompt,
-                interpolation_steps=args.interpolation_steps,
-                interpolate_time_list=interpolate_time_list,
-            ).frames[0]
-            # elapsed_time = time.time() - start_time
-            # print(f"Inference time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+        seeds = list(range(args.num_seeds)) if args.num_seeds > 1 else [args.seed]
 
-        if not args.enable_parallelism or rank == 0:
-            file_count = len(
-                [f for f in os.listdir(args.output_folder) if os.path.isfile(os.path.join(args.output_folder, f))]
-            )
-            output_path = os.path.join(
-                args.output_folder, f"{file_count:04d}_{args.sample_type}_{int(time.time())}.mp4"
-            )
-            export_to_video(output, output_path, fps=24)
+        for seed in seeds:
+            if len(seeds) > 1:
+                print(f"=== Generating with seed {seed}/{len(seeds)-1} ===")
+
+            with torch.no_grad():
+                output = pipe(
+                    prompt=prompt,
+                    negative_prompt=args.negative_prompt,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    generator=torch.Generator(device="cuda").manual_seed(seed),
+                    # stage 1
+                    history_sizes=[16, 2, 1],
+                    num_latent_frames_per_chunk=args.num_latent_frames_per_chunk,
+                    keep_first_frame=True,
+                    # stage 2
+                    is_enable_stage2=args.is_enable_stage2,
+                    pyramid_num_inference_steps_list=args.pyramid_num_inference_steps_list,
+                    # stage 3
+                    is_skip_first_chunk=args.is_skip_first_chunk,
+                    is_amplify_first_chunk=args.is_amplify_first_chunk,
+                    # cfg zero
+                    use_zero_init=args.use_zero_init,
+                    zero_steps=args.zero_steps,
+                    # i2v
+                    image=load_image(image_path).resize((args.width, args.height)) if image_path is not None else None,
+                    image_noise_sigma_min=args.image_noise_sigma_min,
+                    image_noise_sigma_max=args.image_noise_sigma_max,
+                    # v2v
+                    video=load_video(video_path) if video_path is not None else None,
+                    video_noise_sigma_min=args.video_noise_sigma_min,
+                    video_noise_sigma_max=args.video_noise_sigma_max,
+                    # interpolate_prompt
+                    use_interpolate_prompt=args.use_interpolate_prompt,
+                    interpolation_steps=args.interpolation_steps,
+                    interpolate_time_list=interpolate_time_list,
+                ).frames[0]
+
+            if not args.enable_parallelism or rank == 0:
+                output_path = os.path.join(
+                    args.output_folder, f"seed{seed}_{args.sample_type}_{int(time.time())}.mp4"
+                )
+                export_to_video(output, output_path, fps=24)
 
     print(f"Max memory: {torch.cuda.max_memory_allocated() / 1024**3:.3f} GB")
 
