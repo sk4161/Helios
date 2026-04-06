@@ -1,0 +1,3 @@
+[submodule "memfof"]
+	path = memfof
+	url = https://github.com/msu-video-group/memfof.git
