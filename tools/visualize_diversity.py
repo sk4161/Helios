@@ -39,7 +39,10 @@ SEED_RE = re.compile(r"seed(\d+)_")
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--video_dir", type=str, default="output_helios/helios-distilled_i2v")
-    p.add_argument("--mask_path", type=str, default="output_helios/masks/first_frame_ff42_mask.png")
+    p.add_argument("--mask_path", type=str, default="output_helios/masks/first_frame_ff42_mask.png",
+                   help="Static mask PNG (used when --mask_dir is not given)")
+    p.add_argument("--mask_dir", type=str, default=None,
+                   help="Directory of per-video time-varying masks `seed{N}.pt` (bool [T,H,W])")
     p.add_argument("--flow_cache_dir", type=str, default="output_helios/helios-distilled_i2v_flows")
     p.add_argument("--selection_dir", type=str, default="output_helios/helios-distilled_i2v_diverse_top4",
                    help="Directory containing distance_matrix.npy and selected.json")
@@ -136,16 +139,21 @@ def plot_cluster_map(D, seeds, selected_seeds, num_clusters, seed_random, out_pa
     return coords, labels
 
 
-def plot_motion_directions(videos_by_seed, mask_fg, flow_cache_dir, selected_seeds, out_path):
-    """Per-selected-video first frame with mean-flow arrow drawn over the mask."""
+def plot_motion_directions(videos_by_seed, mask_fg, flow_cache_dir, selected_seeds, out_path,
+                           mask_dir=None):
+    """Per-selected-video first frame with mean-flow arrow drawn over the mask.
+
+    If `mask_dir` is given, the per-video time-varying mask is loaded from
+    `<mask_dir>/seed{N}.pt` and used both for the contour (frame 0 mask) and
+    for the per-frame foreground selector when averaging the flow.
+    Otherwise the static `mask_fg` [H, W] is used for everything.
+    """
     n = len(selected_seeds)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
     if n == 1:
         axes = [axes]
 
     H, W = mask_fg.shape
-    fg_yx = np.stack(np.where(mask_fg), axis=1)  # [P, 2] in (y, x)
-    centroid = fg_yx.mean(axis=0)  # (cy, cx)
 
     for ax, seed in zip(axes, selected_seeds):
         path = videos_by_seed[seed]
@@ -154,17 +162,33 @@ def plot_motion_directions(videos_by_seed, mask_fg, flow_cache_dir, selected_see
         # load cached flow [2, T-1, H, W]
         flow_path = Path(flow_cache_dir) / f"seed{seed}.pt"
         flow = torch.load(flow_path, map_location="cpu", weights_only=True).numpy()
-        # mean over time and over mask foreground pixels
-        # flow[0] = u (x-component), flow[1] = v (y-component)
-        u = flow[0][:, mask_fg].mean()
-        v = flow[1][:, mask_fg].mean()
+
+        # pick mask: per-video tracked mask or shared static one
+        if mask_dir is not None:
+            tm = torch.load(Path(mask_dir) / f"seed{seed}.pt", map_location="cpu", weights_only=True).numpy()
+            # tm is [T, H, W]; flow is [2, T-1, H, W]. Build [T-1, H, W] frame mask
+            # by union of consecutive frames so a moving boundary still counts.
+            if tm.shape[0] == flow.shape[1] + 1:
+                frame_mask = tm[:-1] | tm[1:]
+            else:
+                frame_mask = tm[: flow.shape[1]]
+            display_mask = tm[0]  # contour shows frame 0
+            # masked mean over per-frame foreground pixels
+            u = flow[0][frame_mask].mean()
+            v = flow[1][frame_mask].mean()
+            centroid = np.stack(np.where(display_mask), axis=1).mean(axis=0)
+        else:
+            display_mask = mask_fg
+            u = flow[0][:, mask_fg].mean()
+            v = flow[1][:, mask_fg].mean()
+            centroid = np.stack(np.where(mask_fg), axis=1).mean(axis=0)
+
         mag = float(np.hypot(u, v))
         ang = float(np.degrees(np.arctan2(v, u)))
 
         # draw
         ax.imshow(first)
-        # mask outline
-        ax.contour(mask_fg.astype(float), levels=[0.5], colors="cyan", linewidths=1.5)
+        ax.contour(display_mask.astype(float), levels=[0.5], colors="cyan", linewidths=1.5)
 
         # arrow scaled so it's visible regardless of magnitude
         max_extent = 0.35 * min(H, W)
@@ -193,8 +217,14 @@ def plot_motion_directions(videos_by_seed, mask_fg, flow_cache_dir, selected_see
     print(f"Saved {out_path}")
 
 
-def plot_flow_color_per_pixel(videos_by_seed, mask_fg, flow_cache_dir, selected_seeds, out_path):
-    """Show per-pixel mean flow as a color-coded HSV image (hue=direction, sat=mag) over the first frame, masked."""
+def plot_flow_color_per_pixel(videos_by_seed, mask_fg, flow_cache_dir, selected_seeds, out_path,
+                              mask_dir=None):
+    """Show per-pixel mean flow as a color-coded HSV image (hue=direction, sat=mag) over the first frame, masked.
+
+    If `mask_dir` is given, the per-video time-varying union-mask (any frame
+    where the cat is present) is used as the visible region instead of the
+    static mask.
+    """
     from matplotlib.colors import hsv_to_rgb
 
     n = len(selected_seeds)
@@ -207,12 +237,19 @@ def plot_flow_color_per_pixel(videos_by_seed, mask_fg, flow_cache_dir, selected_
     # find global magnitude scale across selected for consistent saturation
     mags = []
     flows = {}
+    masks_by_seed = {}
     for seed in selected_seeds:
         f = torch.load(Path(flow_cache_dir) / f"seed{seed}.pt", map_location="cpu", weights_only=True).numpy()
         mean_flow = f.mean(axis=1)  # [2, H, W] mean over time
         flows[seed] = mean_flow
         mag = np.hypot(mean_flow[0], mean_flow[1])
-        mags.append(mag[mask_fg].max())
+        if mask_dir is not None:
+            tm = torch.load(Path(mask_dir) / f"seed{seed}.pt", map_location="cpu", weights_only=True).numpy()
+            seed_mask = tm.any(axis=0)  # union over time
+            masks_by_seed[seed] = seed_mask
+            mags.append(mag[seed_mask].max() if seed_mask.any() else 0.0)
+        else:
+            mags.append(mag[mask_fg].max())
     global_max_mag = max(mags) if mags else 1.0
 
     for ax, seed in zip(axes, selected_seeds):
@@ -226,14 +263,15 @@ def plot_flow_color_per_pixel(videos_by_seed, mask_fg, flow_cache_dir, selected_
 
         hsv = np.stack([ang, mag, np.ones_like(ang)], axis=-1)
         rgb = (hsv_to_rgb(hsv) * 255).astype(np.uint8)
-        # composite: dim background, mask region shows flow color
+
+        seed_mask = masks_by_seed[seed] if mask_dir is not None else mask_fg
         composite = first.astype(np.float32) * 0.35
-        m3 = mask_fg[..., None]
+        m3 = seed_mask[..., None]
         composite = np.where(m3, rgb.astype(np.float32), composite)
         composite = np.clip(composite, 0, 255).astype(np.uint8)
 
         ax.imshow(composite)
-        ax.contour(mask_fg.astype(float), levels=[0.5], colors="white", linewidths=1.0)
+        ax.contour(seed_mask.astype(float), levels=[0.5], colors="white", linewidths=1.0)
         ax.set_title(f"seed {seed}")
         ax.axis("off")
 
@@ -286,6 +324,7 @@ def main():
         flow_cache_dir=args.flow_cache_dir,
         selected_seeds=selected_seeds,
         out_path=out_dir / "motion_directions.png",
+        mask_dir=args.mask_dir,
     )
 
     # 3. per-pixel flow color
@@ -295,6 +334,7 @@ def main():
         flow_cache_dir=args.flow_cache_dir,
         selected_seeds=selected_seeds,
         out_path=out_dir / "motion_flow_color.png",
+        mask_dir=args.mask_dir,
     )
 
 
