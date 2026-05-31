@@ -177,6 +177,9 @@ def parse_args():
         help="The number of blocks to bundle together in each offloading group. Only relevant when using block-level offloading.",
     )
 
+    # === Flash Attention ===
+    parser.add_argument("--disable_flash_attention", action="store_true")
+
     return parser.parse_args()
 
 
@@ -241,16 +244,18 @@ def main():
         transformer = replace_rmsnorm_with_fp32(transformer)
         transformer = replace_all_norms_with_flash_norms(transformer)
         replace_rope_with_flash_rope()
-    cuda_major = torch.cuda.get_device_capability()[0]
-    if cuda_major >= 9:
-        # H100/H800 (SM90+) with FA3
-        try:
-            transformer.set_attention_backend("_flash_3_hub")
-        except Exception:
+
+    if not args.disable_flash_attention:        
+        cuda_major = torch.cuda.get_device_capability()[0]
+        if cuda_major >= 9:
+            # H100/H800 (SM90+) with FA3
+            try:
+                transformer.set_attention_backend("_flash_3_hub")
+            except Exception:
+                transformer.set_attention_backend("flash_hub")
+        else:
+            # 4090/A100 etc (SM89+) with FA2
             transformer.set_attention_backend("flash_hub")
-    else:
-        # 4090/A100 etc (SM89+) with FA2
-        transformer.set_attention_backend("flash_hub")
 
     vae = AutoencoderKLWan.from_pretrained(
         args.base_model_path,
