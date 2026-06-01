@@ -38,8 +38,15 @@ def parse_args():
     p.add_argument("--bbox", type=float, nargs=4, default=None, metavar=("X1", "Y1", "X2", "Y2"),
                    help="Skip GroundingDINO and use this bbox directly (in video pixel coords).")
     p.add_argument("--gdino_model", type=str, default="IDEA-Research/grounding-dino-tiny")
-    p.add_argument("--sam2_video_model", type=str, default="facebook/sam2-hiera-base-plus")
+    p.add_argument("--sam2_video_model", type=str, default="facebook/sam2.1-hiera-tiny",
+                   help="HF SAM2 video model id. Default: sam2.1-hiera-tiny (39M params, "
+                        "91.2 FPS on A100, 76.5 J&F on SA-V — slightly worse than base_plus "
+                        "(78.2 J&F) but ~1.4x faster. Use facebook/sam2.1-hiera-base-plus for "
+                        "best quality, or facebook/sam2.1-hiera-large for max quality.)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"],
+                   help="Compute dtype for SAM2. bf16 (default) matches the published SAM2.1 "
+                        "FPS numbers; fp32 is ~2x slower with no quality benefit for tracking.")
     p.add_argument("--video_glob", type=str, default="seed*.mp4")
     p.add_argument("--box_threshold", type=float, default=0.35)
     p.add_argument("--text_threshold", type=float, default=0.25)
@@ -94,7 +101,8 @@ def detect_bbox_with_gdino(image: Image.Image, text: str, gdino_model: str,
 
 @torch.no_grad()
 def track_video(model: Sam2VideoModel, processor: Sam2VideoProcessor,
-                frames: list[Image.Image], bbox_xyxy: list[float], device: str) -> torch.Tensor:
+                frames: list[Image.Image], bbox_xyxy: list[float], device: str,
+                dtype: torch.dtype) -> torch.Tensor:
     """Run SAM2 video tracking with a single bbox seed at frame 0.
     Returns bool tensor [T, H, W] (True = foreground)."""
     H, W = frames[0].height, frames[0].width
@@ -103,7 +111,7 @@ def track_video(model: Sam2VideoModel, processor: Sam2VideoProcessor,
     session = processor.init_video_session(
         video=frames,
         inference_device=device,
-        dtype=torch.float32,
+        dtype=dtype,
     )
     # Add the bbox at frame 0 for object id 1
     processor.add_inputs_to_inference_session(
@@ -165,10 +173,14 @@ def main():
             args.box_threshold, args.text_threshold,
         )
 
-    # Load SAM2 video model once
-    print(f"Loading SAM2 video ({args.sam2_video_model})...")
+    # Load SAM2 video model once.
+    # bf16 is the recommended dtype for SAM2 inference (the published 64-91 FPS
+    # numbers in the SAM2.1 README assume bf16). fp32 ran the encoder's MHSA at
+    # ~2x the cost with no measurable quality gain for tracking.
+    print(f"Loading SAM2 video ({args.sam2_video_model}) in {args.dtype}...")
+    sam_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     processor = Sam2VideoProcessor.from_pretrained(args.sam2_video_model)
-    model = Sam2VideoModel.from_pretrained(args.sam2_video_model).to(args.device).eval()
+    model = Sam2VideoModel.from_pretrained(args.sam2_video_model, dtype=sam_dtype).to(args.device).eval()
 
     summary = {"bbox": bbox, "videos": {}}
     for seed, path in tqdm(videos, desc="track"):
@@ -177,7 +189,7 @@ def main():
             mask = torch.load(out_path, map_location="cpu", weights_only=True)
         else:
             frames = load_video_frames_pil(path)
-            mask = track_video(model, processor, frames, bbox, args.device)
+            mask = track_video(model, processor, frames, bbox, args.device, sam_dtype)
             torch.save(mask, out_path)
             del frames
         fg_frac = mask.float().mean().item()
