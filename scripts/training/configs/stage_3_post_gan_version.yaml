@@ -4,7 +4,7 @@ seed: 49
 
 
 report_to:
-  tracker_name: Wan-Train
+  tracker_name: Helios-Train
   wandb_name: ablation_stage_3_post_gan_version
   report_to: wandb
 

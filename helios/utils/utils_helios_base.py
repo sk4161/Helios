@@ -176,7 +176,7 @@ def downsample_corrupt(model_input, downsample_min_corrupt_ratio, downsample_max
 
     if is_5d:
         B, C, T, H, W = model_input.shape
-        model_input = model_input.view(B * T, C, H, W)
+        model_input = model_input.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
     else:
         B, C, H, W = model_input.shape
 
@@ -190,7 +190,7 @@ def downsample_corrupt(model_input, downsample_min_corrupt_ratio, downsample_max
     model_input = F.interpolate(model_input, size=(h0, w0), mode="bilinear", align_corners=False, antialias=True)
 
     if is_5d:
-        model_input = model_input.view(B, C, T, H, W)
+        model_input = model_input.reshape(B, T, C, H, W).permute(0, 2, 1, 3, 4)
 
     return model_input
 

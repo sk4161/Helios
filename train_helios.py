@@ -1785,7 +1785,7 @@ def main(args):
                     )
                     if not (
                         USE_GAN
-                        and (args.training_config.is_gan_aprox_grad or args.training_config.is_gan_low_vram_mode)
+                        and args.training_config.is_gan_low_vram_mode
                     ):
                         critic_accelerator.backward(critic_loss)
 

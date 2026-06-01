@@ -1,13 +1,14 @@
-torch==2.7.1
-torchvision==0.22.1
-torchaudio==2.7.1
-triton==3.3.1
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+triton==3.6.0
+kernels==0.13.0
 # diffusers==0.36.0
 # transformers==4.57.6
 # sentence-transformers==5.2.3
-git+https://github.com/SHYuanBest/diffusers.git@test
-git+https://github.com/huggingface/transformers.git
-git+https://github.com/huggingface/sentence-transformers.git
+git+https://github.com/huggingface/diffusers.git
+transformers==5.3.0
+sentence-transformers==5.2.3
 accelerate==1.12.0
 deepspeed==0.18.4
 peft==0.18.1
@@ -16,6 +17,8 @@ zstandard==0.25.0
 wandb==0.23.0
 video-reader-rs==0.4.1
 numpy<2.0.0
+timm>=0.9
+openai
 pandas
 pillow
 tqdm
@@ -23,9 +26,7 @@ scipy
 opencv-python
 scikit-image
 ffmpeg-python
-video-reader-rs
 openai-clip
 pyiqa
-timm>=0.9
 omegaconf
 easydict

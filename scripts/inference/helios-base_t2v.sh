@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES=0 python infer_helios.py \
 
     # --enable_low_vram_mode \
     # --group_offloading_type "leaf_level" \  # ["leaf_level", "block_level"]
-    # --num_blocks_per_group
+    # --num_blocks_per_group 4 \
     # --use_cfg_zero_star \
     # --use_zero_init \
     # --zero_steps 1 \

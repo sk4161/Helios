@@ -2,6 +2,7 @@ torch==2.10.0
 torchvision==0.25.0
 torchaudio==2.10.0
 triton==3.6.0
+kernels==0.13.0
 # diffusers==0.36.0
 # transformers==4.57.6
 git+https://github.com/huggingface/diffusers.git
@@ -30,6 +31,5 @@ omegaconf
 mpi4py
 hf-doc-builder
 torchdata
-kernels
 loguru
 tf_keras
