@@ -42,3 +42,9 @@ Videoreward
 1_formal_ckpts
 demo_data
 BestWishYSH
+
+*.npy
+*.mp4
+*.txt
+*.png
+*.json
