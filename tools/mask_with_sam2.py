@@ -7,18 +7,16 @@ Outputs:
   - <stem>_overlay.png    : input with semi-transparent colored mask + bbox (verification)
 """
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
+from transformers import Sam2Model, Sam2Processor
 
-from transformers import (
-    GroundingDinoForObjectDetection,
-    GroundingDinoProcessor,
-    Sam2Model,
-    Sam2Processor,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # make sam2_common importable
+from sam2_common import detect_boxes_with_gdino, enable_tf32  # noqa: E402
 
 
 def parse_args():
@@ -39,6 +37,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Match sam2/sam2/benchmark.py compute settings: bf16 autocast + TF32 on Ampere+.
+    use_amp = args.device.startswith("cuda")
+    enable_tf32(args.device)
+
     image_path = Path(args.image_path)
     out_dir = Path(args.output_dir) if args.output_dir else image_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -47,32 +49,15 @@ def main():
     image = Image.open(image_path).convert("RGB")
     print(f"Loaded image: {image.size}")
 
-    # ---------- 1. GroundingDINO: text -> bbox ----------
-    print(f"Loading GroundingDINO ({args.gdino_model})...")
-    gdino_processor = GroundingDinoProcessor.from_pretrained(args.gdino_model)
-    gdino_model = GroundingDinoForObjectDetection.from_pretrained(args.gdino_model).to(args.device)
-
-    inputs = gdino_processor(images=image, text=args.text, return_tensors="pt").to(args.device)
-    with torch.no_grad():
-        outputs = gdino_model(**inputs)
-
-    results = gdino_processor.post_process_grounded_object_detection(
-        outputs,
-        threshold=args.box_threshold,
-        text_threshold=args.text_threshold,
-        target_sizes=[image.size[::-1]],
-    )[0]
-
-    boxes = results["boxes"].cpu().numpy()
-    scores = results["scores"].cpu().numpy()
-    labels = results["text_labels"] if "text_labels" in results else results.get("labels", [])
+    # ---------- 1. GroundingDINO: text -> boxes ----------
+    print(f"Detecting '{args.text}' with GroundingDINO ({args.gdino_model})...")
+    boxes, scores, labels = detect_boxes_with_gdino(
+        image, args.text, args.gdino_model, args.device,
+        args.box_threshold, args.text_threshold, use_amp=use_amp,
+    )
     print(f"Found {len(boxes)} boxes:")
     for b, s, l in zip(boxes, scores, labels):
         print(f"  {l} score={s:.3f} box={b.tolist()}")
-
-    if len(boxes) == 0:
-        raise RuntimeError(f"No detections for prompt '{args.text}' in {image_path}. "
-                           "Try lowering --box_threshold or rephrasing the prompt.")
 
     # ---------- 2. SAM2: bbox -> mask ----------
     print(f"Loading SAM2 ({args.sam2_model})...")
@@ -86,7 +71,7 @@ def main():
         return_tensors="pt",
     ).to(args.device)
 
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast("cuda", torch.bfloat16, enabled=use_amp):
         sam_outputs = sam_model(**sam_inputs, multimask_output=False)
 
     masks = sam_processor.post_process_masks(

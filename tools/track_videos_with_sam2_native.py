@@ -1,25 +1,15 @@
 """
-Track an object across all frames of every mp4 in --video_dir using
-**native** SAM2 (facebookresearch/sam2 submodule) instead of the HuggingFace
-transformers wrapper.
-
-Why a separate script:
-  The HF Sam2VideoModel wrapper currently lacks the optimizations the SAM2
-  benchmark.py uses (torch.compile of memory_encoder/memory_attention/prompt
-  encoder/mask decoder + image-encoder compile + torch.autocast + TF32).
-  Measured on the Helios 97x384x640 sample with SAM2.1-hiera-tiny:
-      HF + bf16 (track_videos_with_sam2.py):   ~24.6 FPS
-      Native, no compile:                       ~46.0 FPS
-      Native + vos_optimized (mode=default):    ~61.1 FPS   ← this script
-      Spec (mode=max-autotune, torch 2.5.1):    91.2 FPS
-
-GroundingDINO bbox seeding is identical to the HF script.
+Track an object across all frames of every mp4 in --video_dir with native SAM2
+(facebookresearch/sam2), using the same fast path as sam2/sam2/benchmark.py:
+torch.autocast(bf16) + TF32 + vos_optimized (torch.compile of memory_encoder /
+memory_attention / prompt encoder / mask decoder). Seed the first frame with a
+GroundingDINO bbox (or --bbox) and save per-frame bool masks [T,H,W] to
+--output_dir/seed{N}.pt.
 
 Limitation: the SAM2 repository check at sam2/sam2/build_sam.py:20-32 errors
-out if Python's CWD or sys.path[0] contains a `sam2/` directory (because the
-HF Helios repo includes the sam2 submodule at ./sam2). This script `cd`s to
-/tmp at startup so the installed `sam2` package is found instead of the
-submodule shadowing it.
+out if Python's CWD or sys.path[0] contains a `sam2/` directory (the Helios repo
+ships the sam2 submodule at ./sam2). This script `cd`s to /tmp at startup so the
+installed `sam2` package is found instead of the submodule shadowing it.
 """
 import argparse
 import json
@@ -42,7 +32,8 @@ os.chdir("/tmp")
 if sys.path and (sys.path[0] == "" or Path(sys.path[0]).resolve() == _HELIOS_ROOT):
     sys.path = sys.path[1:]
 
-from transformers import GroundingDinoForObjectDetection, GroundingDinoProcessor  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # make sam2_common importable
+from sam2_common import best_box, detect_boxes_with_gdino, enable_tf32  # noqa: E402
 
 SEED_RE = re.compile(r"seed(\d+)_")
 
@@ -87,30 +78,6 @@ def load_first_frame_pil(path: Path) -> Image.Image:
     buf = vr.decode()  # [T, H, W, 3] uint8
     del vr
     return Image.fromarray(buf[0])
-
-
-def detect_bbox_with_gdino(image: Image.Image, text: str, gdino_model: str,
-                           device: str, box_thr: float, text_thr: float) -> list[float]:
-    processor = GroundingDinoProcessor.from_pretrained(gdino_model)
-    model = GroundingDinoForObjectDetection.from_pretrained(gdino_model).to(device)
-    inputs = processor(images=image, text=text, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    results = processor.post_process_grounded_object_detection(
-        outputs, threshold=box_thr, text_threshold=text_thr,
-        target_sizes=[image.size[::-1]],
-    )[0]
-    boxes = results["boxes"].cpu().numpy()
-    scores = results["scores"].cpu().numpy()
-    if len(boxes) == 0:
-        raise RuntimeError(f"GroundingDINO found no boxes for prompt {text!r}")
-    best = int(np.argmax(scores))
-    bbox = boxes[best].tolist()
-    print(f"GroundingDINO bbox: {bbox} (score={scores[best]:.3f})")
-    del model, processor
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-    return bbox
 
 
 def patch_vos_compile_mode():
@@ -169,6 +136,8 @@ def main():
         raise SystemExit(f"No videos in {video_dir}")
     print(f"Found {len(videos)} videos in {video_dir}")
 
+    enable_tf32(args.device)
+
     # Resolve seed bbox on the first frame of the first video (or user-provided)
     if args.bbox is not None:
         bbox = list(args.bbox)
@@ -178,17 +147,14 @@ def main():
             ref_img = Image.open(args.reference_image).convert("RGB")
         else:
             ref_img = load_first_frame_pil(videos[0][1])
-        sample_h, sample_w = ref_img.size[1], ref_img.size[0]
-        bbox = detect_bbox_with_gdino(
+        boxes, scores, _ = detect_boxes_with_gdino(
             ref_img, args.text, args.gdino_model, args.device,
             args.box_threshold, args.text_threshold,
         )
+        bbox = best_box(boxes, scores)
 
-    # SAM2.1 spec config: bf16 autocast + TF32
+    # bf16 autocast for the SAM2 tracking pass (matches sam2/sam2/benchmark.py).
     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
 
     if not args.no_compile:
         patch_vos_compile_mode()
