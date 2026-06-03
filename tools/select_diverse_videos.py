@@ -139,18 +139,15 @@ def parse_args():
                         "Videos with seeds not in this list are skipped. Use to chain "
                         "cascading rounds: pass the previous round's selected_seeds here.")
     p.add_argument("--mm_mask_mode", type=str, default="frame0", choices=["frame0", "per_frame"],
-                   help="(--mm_compat only) Mask treatment: 'frame0' (default, MotionModes-faithful, "
-                        "uses frame-0 SAM2 slice) or 'per_frame' (uses each frame's SAM2 mask at "
-                        "static coords — semantically misaligned with origin-anchored trajectory "
-                        "but uses more information).")
+                   help="(deprecated, unused) --mm_compat now always uses the SAM2 "
+                        "time-varying mask, OR-reduced per horizon window.")
     p.add_argument("--mm_compat", action="store_true",
-                   help="Match MotionModes' training representation exactly: full-video "
-                        "trajectory from frame 0 (ignores --horizon), normalize positions "
-                        "via (pos/dim + 1)/2 to [0,1], distance kernel uses (flow*2-1) "
-                        "with clamp(-1,1) per motion_losses_ours.py:991-1043. Frame-0 "
-                        "mask only. Empirically drift-prone on RAFT-integrated input "
-                        "(see feedback_diversity_short_horizon_with_visibility.md); use "
-                        "for direct comparison with MotionModes-derived data.")
+                   help="Use the MotionModes distance kernel (motion_losses_ours.py:991-1043): "
+                        "normalize positions to MM 'flow' space (pos/dim, == (pos/dim+1)/2 then "
+                        "*2-1) and clamp(-1,1), off-screen handled by clamp (not visibility "
+                        "exclusion). Unlike the default path it does NOT use the principled "
+                        "visibility mask. Honors --horizon (window difference in MM-normalized "
+                        "space; --horizon 1 = instantaneous). Foreground = SAM2 time-varying mask.")
     return p.parse_args()
 
 
@@ -846,38 +843,46 @@ def main():
             H, W = H_motion, W_motion
 
     if args.mm_compat:
-        # MotionModes-exact path: full trajectory from frame 0 in [0, 1] format,
-        # `flow*2-1, clamp(-1,1)` distance kernel, frame-0 mask only.
-        if args.horizon != 1:
-            print(f"NOTE: --mm_compat ignores --horizon={args.horizon} (uses full trajectory)")
-        print("Motion representation: MotionModes-exact (full trajectory, [0,1] norm, clamp kernel)")
-        motion = []  # list of [2, T-1, H, W] CPU float32, values in [0,1]-ish
+        # MotionModes kernel, honoring --horizon. Representation: integrate the
+        # per-pixel trajectory, take the horizon-window displacement, normalize to
+        # MotionModes "flow" space — pos/dim, i.e. MotionModes' (pos/dim+1)/2 followed
+        # by the kernel's *2-1 (they cancel) — then clamp(-1, 1). Off-screen pixels are
+        # handled by the clamp (not by visibility exclusion). Distance uses the same
+        # magnitude+angle kernel; foreground = SAM2 time-varying mask, OR-reduced over
+        # each (horizon+1)-frame window (no frame-0-only restriction).
+        horizon = args.horizon
+        T1_first = (trajectories[0] if using_traj else flows[0]).shape[1]
+        T_motion = (T1_first + 1) - horizon
+        print(f"Motion representation: MotionModes kernel (MM-normalized window diff), "
+              f"horizon={horizon}  (per-video shape: [2, {T_motion}, {H}, {W}])")
+
+        def _mm_normalize(disp: torch.Tensor) -> torch.Tensor:
+            # raw-pixel window displacement -> MM flow space (pos/dim), clamped to [-1, 1]
+            out = torch.empty_like(disp)
+            out[0] = (disp[0] / W).clamp(-1.0, 1.0)
+            out[1] = (disp[1] / H).clamp(-1.0, 1.0)
+            return out
+
+        motion = []  # list of [2, T-horizon, H, W] CPU float32 in [-1, 1]
         if using_traj:
-            # DOT trajectories: just normalize positions to [0,1]
-            for t in tqdm(trajectories, desc="mm_traj_norm"):
-                t = t.clone()
-                t[0] = t[0] / W
-                t[1] = t[1] / H
-                motion.append(((t + 1) / 2).contiguous())
+            for t in tqdm(trajectories, desc="mm_horizon(traj)"):
+                t_dev = t.to(device)
+                disp, _ = horizon_displacement_from_trajectory(t_dev, horizon)
+                motion.append(_mm_normalize(disp).cpu())
+                del t_dev, disp
             del trajectories
         else:
-            for f in tqdm(flows, desc="mm_traj"):
+            for f in tqdm(flows, desc="mm_horizon"):
                 f_dev = f.to(device)
-                mm = compute_mm_trajectory(f_dev)
-                motion.append(mm.cpu())
-                del f_dev, mm
-            if args.device.startswith("cuda"):
-                torch.cuda.empty_cache()
+                disp, _ = compute_horizon_displacement(f_dev, horizon)
+                motion.append(_mm_normalize(disp).cpu())
+                del f_dev, disp
             del flows
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
-        # Build per-video masks. SAM2 per-frame masks are already aligned with the
-        # trajectory time axis: trajectory index t corresponds to position at frame
-        # t+1, so we use mask[1 : T] directly (length T-1) as a 3D per-frame mask.
-        # No trajectory warping needed — SAM2 already tracked the object per frame.
-        print("Building per-video masks (per-frame SAM2 mask, aligned with trajectory)...")
-
+        # Foreground = SAM2 time-varying mask, OR-reduced over each window to T-horizon.
         def _resize_mask_mm(m: torch.Tensor) -> torch.Tensor:
-            # m: 2D [H, W] or 3D [T, H, W] bool. Resize spatial dims to (H, W) if needed.
             if m.shape[-2:] == (H, W):
                 return m
             if m.dim() == 2:
@@ -888,40 +893,53 @@ def main():
             mf = F.interpolate(mf, size=(H, W), mode="nearest")
             return mf.squeeze(1).bool()
 
-        masks_dev: list = []
-        T_traj = motion[0].shape[1]
+        def _reduce_time_varying(m: torch.Tensor, h: int) -> torch.Tensor:
+            # m: [T, H, W] bool -> [T - h, H, W], OR over each window m[t : t + h + 1].
+            T_orig = m.shape[0]
+            if T_orig - h != T_motion:
+                raise ValueError(f"mask T={T_orig} incompatible with horizon={h}; need T-h=={T_motion}")
+            out = torch.empty(T_motion, *m.shape[1:], device=m.device, dtype=torch.bool)
+            for t in range(T_motion):
+                out[t] = m[t : t + h + 1].any(dim=0)
+            return out
+
+        print("Building per-video masks (SAM2 time-varying, OR-reduced per window)...")
+        combined_masks_dev = []
         for idx, (seed, _) in enumerate(videos):
             if use_no_mask:
-                masks_dev.append(None)
+                combined_masks_dev.append(None)
             elif use_time_varying_mask:
                 m = torch.load(mask_dir / f"seed{seed}.pt", map_location="cpu", weights_only=True)
-                if args.mm_mask_mode == "per_frame":
-                    # Use each frame's SAM2 mask. Note: this is at static (y, x) coords,
-                    # not warped along the trajectory; semantically misaligned but uses
-                    # more information than frame-0 alone.
-                    m = m[1 : T_traj + 1]
-                else:
-                    # MotionModes-faithful frame-0 mask (motion_losses_ours.py:1032).
-                    m = m[0]
+                if max_frames is not None and m.shape[0] > max_frames:
+                    m = m[:max_frames]
                 m = _resize_mask_mm(m)
-                masks_dev.append(m.to(device))
+                combined_masks_dev.append(_reduce_time_varying(m, horizon).to(device))
             else:
-                masks_dev.append(_resize_mask_mm(static_mask_fg).to(device))
+                static = _resize_mask_mm(static_mask_fg)
+                combined_masks_dev.append(static.unsqueeze(0).expand(T_motion, H, W).contiguous().to(device))
 
         N = len(motion)
-        print(f"Computing {N}x{N} distance matrix (MotionModes kernel)...")
+        print(f"Computing {N}x{N} distance matrix (MotionModes kernel, horizon={horizon})...")
         motion_dev = [m.to(device) for m in motion]
+
+        motion_mag = None
+        if args.motion_threshold > 0:
+            motion_mag = [m.pow(2).sum(0).sqrt() for m in motion_dev]
+
         D = np.zeros((N, N), dtype=np.float64)
         for i in tqdm(range(N), desc="dist"):
             for j in range(i + 1, N):
                 pair_mask = None
-                if masks_dev[i] is not None and masks_dev[j] is not None:
-                    pair_mask = masks_dev[i] & masks_dev[j]  # 2D intersection
-                d = pairwise_distance_mm(motion_dev[i], motion_dev[j], pair_mask)
+                if combined_masks_dev[i] is not None and combined_masks_dev[j] is not None:
+                    pair_mask = combined_masks_dev[i] & combined_masks_dev[j]
+                if motion_mag is not None:
+                    gate = (motion_mag[i] > args.motion_threshold) | (motion_mag[j] > args.motion_threshold)
+                    pair_mask = gate if pair_mask is None else (pair_mask & gate)
+                d = pairwise_distance(motion_dev[i], motion_dev[j], pair_mask)
                 D[i, j] = d
                 D[j, i] = d
-
-        combined_masks_dev = masks_dev  # for downstream cleanup symmetry
+        if motion_mag is not None:
+            del motion_mag
 
     else:
         # Build motion representation = horizon-window cumulative displacement + visibility.
