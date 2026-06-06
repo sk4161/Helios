@@ -18,6 +18,16 @@ import re
 import sys
 from pathlib import Path
 
+# Persist the torch.inductor compile cache on shared storage so SAM2's vos_optimized
+# compile (esp. the image encoder's max-autotune) is reused across runs/nodes instead
+# of recompiling (~5 min) each time. Must be set before importing torch. Same compiled
+# kernels -> bit-identical outputs (zero accuracy impact). Override by exporting
+# TORCHINDUCTOR_CACHE_DIR yourself.
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    str(Path(__file__).resolve().parent.parent / ".torchinductor_cache"),
+)
+
 import numpy as np
 import torch
 from PIL import Image
@@ -182,6 +192,8 @@ def main():
         "vos_optimized": not args.no_compile,
         "videos": {},
     }
+    import time as _time
+    _t_track0 = _time.time()
     for seed, path in tqdm(videos, desc="track"):
         out_path = out_dir / f"seed{seed}.pt"
         if out_path.exists():
@@ -191,6 +203,10 @@ def main():
             torch.save(mask, out_path)
         fg_frac = mask.float().mean().item()
         summary["videos"][seed] = {"fg_frac_mean": fg_frac, "T": int(mask.shape[0])}
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[TIME] sam2_tracking = {_time.time() - _t_track0:.2f}s  "
+          f"(per-video init_state encode + propagate; excl model build / GDINO / compile)")
 
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"Wrote {out_dir/'summary.json'}")
