@@ -46,6 +46,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -269,93 +270,6 @@ def compute_flow_memfof(model, frames: torch.Tensor, device: str, iters: int) ->
 
     flow = torch.stack(out_flows, dim=1)  # [2, T-1, H, W]
     return flow.contiguous()
-
-
-@torch.no_grad()
-def compute_mm_trajectory(flow: torch.Tensor) -> torch.Tensor:
-    """MotionModes-exact representation: position at each frame, anchored at frame 0,
-    normalized to [0, 1] via `(pos/dim + 1) / 2`.
-
-    Mirrors MotionModes/train_ctrl_flow_gen_dot.py:625-646 (which uses DOT instead
-    of RAFT/MEMFOF integration — DOT outputs absolute positions directly without
-    drift; we approximate via forward integration of frame-to-frame flow).
-
-    flow: [2, T-1, H, W] frame-to-frame pixel-unit displacement.
-    Returns: [2, T-1, H, W] in [0, 1] (off-screen pixels can exceed; the
-      distance kernel `pairwise_distance_mm` clamps them back to [-1, 1] after
-      its `*2 - 1` rescale).
-    """
-    _, T1, H, W = flow.shape
-    device = flow.device
-    dtype = flow.dtype
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device, dtype=dtype),
-        torch.arange(W, device=device, dtype=dtype),
-        indexing="ij",
-    )
-    pos_x = xx.clone()
-    pos_y = yy.clone()
-    sx = 2.0 / max(W - 1, 1)
-    sy = 2.0 / max(H - 1, 1)
-    pos_list = []
-    for t in range(T1):
-        gx = sx * pos_x - 1.0
-        gy = sy * pos_y - 1.0
-        grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
-        sampled = F.grid_sample(
-            flow[:, t].unsqueeze(0),
-            grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True,
-        )
-        pos_x = pos_x + sampled[0, 0]
-        pos_y = pos_y + sampled[0, 1]
-        pos_list.append(torch.stack([pos_x, pos_y], dim=0))
-    traj = torch.stack(pos_list, dim=1)  # [2, T-1, H, W]
-    traj[0] = traj[0] / W
-    traj[1] = traj[1] / H
-    return ((traj + 1) / 2).contiguous()
-
-
-def pairwise_distance_mm(t_i: torch.Tensor, t_j: torch.Tensor,
-                         mask_fg: torch.Tensor | None = None,
-                         eps: float = 1e-8) -> float:
-    """MotionModes-exact pairwise distance kernel (motion_losses_ours.py:991-1043,
-    symmetric form): rescale flow*2-1, clamp(-1,1), then magnitude + angle.
-
-    t_i, t_j: [2, T, H, W] in [0, 1] (output of compute_mm_trajectory).
-    mask_fg: optional foreground selector.
-        - None: use all pixels
-        - 2D [H, W]: same static mask broadcast across T frames (e.g., frame-0)
-        - 3D [T, H, W]: per-frame mask (e.g., trajectory_aligned_mask output)
-    """
-    t_i = (t_i * 2 - 1).clamp(-1, 1)
-    t_j = (t_j * 2 - 1).clamp(-1, 1)
-    diff = (t_i - t_j).abs()
-    mag = torch.sqrt(t_i.pow(2) + t_j.pow(2) + eps)
-    normalized_diff = diff / (mag + eps)
-    i_n = F.normalize(t_i, dim=0)
-    j_n = F.normalize(t_j, dim=0)
-    cos_sim = (i_n * j_n).sum(dim=0)
-    angle_diff = torch.acos(cos_sim.clamp(-1.0 + eps, 1.0 - eps))
-    combined = normalized_diff.mean(dim=0) + angle_diff  # [T, H, W]
-    if mask_fg is None:
-        return combined.mean().item()
-    if mask_fg.dim() == 2:
-        fg = mask_fg.unsqueeze(0).expand_as(combined)
-    elif mask_fg.dim() == 3:
-        if mask_fg.shape != combined.shape:
-            raise ValueError(
-                f"3D mask shape {tuple(mask_fg.shape)} != combined shape {tuple(combined.shape)}"
-            )
-        fg = mask_fg
-    else:
-        raise ValueError(f"mask_fg must be 2D or 3D, got {mask_fg.shape}")
-    n_valid = int(fg.sum())
-    if n_valid == 0:
-        return float("nan")
-    return combined[fg].mean().item()
 
 
 @torch.no_grad()
@@ -690,6 +604,7 @@ def compute_unary_clip(
     img_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
     img_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
 
+    _t_clip0 = time.time()
     for idx, (seed, path) in enumerate(tqdm(videos, desc="clip")):
         cache_file = (cache_dir / f"seed{seed}_{key}.npy") if cache_dir is not None else None
         if cache_file is not None and cache_file.exists():
@@ -713,6 +628,9 @@ def compute_unary_clip(
             np.save(cache_file, np.array(score, dtype=np.float32))
         del frames, sel, img_emb, sim
 
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
+    print(f"[TIME] clip_unary_forward = {time.time() - _t_clip0:.2f}s  (excl CLIP model load)")
     del m_clip
     if str(device).startswith("cuda"):
         torch.cuda.empty_cache()
@@ -786,6 +704,7 @@ def main():
             trajectories.append(t)
         print(f"Loaded {len(trajectories)} pre-computed trajectories from {traj_dir} (skipping flow)")
     else:
+        _t_flow0 = time.time()
         # Enable TF32 (Ampere+) — a free ~10-20% speedup on RAFT/MEMFOF matmul.
         if str(args.device).startswith("cuda") and torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -806,6 +725,7 @@ def main():
             sys.exit(f"Unknown flow backend: {args.flow_backend}")
 
         # Compute flows (cache-aware) — cache filenames include backend tag
+        _t_flowc0 = time.time()
         for seed, path in tqdm(videos, desc="flow"):
             cache_file = (cache_dir / f"seed{seed}.pt") if cache_dir is not None else None
             if cache_file is not None and cache_file.exists():
@@ -822,13 +742,18 @@ def main():
                     torch.save(flow, cache_file)
                 del frames
             flows.append(flow)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[TIME] flow_compute = {time.time() - _t_flowc0:.2f}s  (excl RAFT model load)")
 
         # Free GPU model — distances are computed on flows directly
         del model
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
+        print(f"[TIME] optical_flow_generation = {time.time() - _t_flow0:.2f}s")
 
     device = torch.device(args.device)
+    _t_sel0 = time.time()
 
     # If pre-computed trajectories (or downsampled flows) have a different (H, W)
     # than the video, override H, W. Masks downstream are resized to match.
@@ -1038,6 +963,7 @@ def main():
             del all_mag
 
         D = np.zeros((N, N), dtype=np.float64)
+        _t_dist0 = time.time()
         for i in tqdm(range(N), desc="dist"):
             for j in range(i + 1, N):
                 pair_mask = combined_masks_dev[i] & combined_masks_dev[j]
@@ -1048,6 +974,9 @@ def main():
                 d = pairwise_distance(motion_dev[i], motion_dev[j], pair_mask)
                 D[i, j] = d
                 D[j, i] = d
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[TIME] distance_matrix = {time.time() - _t_dist0:.2f}s")
         if motion_mag is not None:
             del motion_mag
 
@@ -1084,6 +1013,7 @@ def main():
               f"mean={unary_scores.mean():.4f} max={unary_scores.max():.4f}")
 
     # Selection
+    _t_alg0 = time.time()
     if args.selector == "fps":
         if unary_scores is not None:
             print("NOTE: --unary scores are computed and logged, but --selector=fps "
@@ -1098,10 +1028,12 @@ def main():
               f"unary={'clip' if unary_scores is not None else 'zero'}")
     else:
         sys.exit(f"Unknown selector: {args.selector}")
+    print(f"[TIME] select_algo = {time.time() - _t_alg0:.3f}s")
 
     selected_seeds = [videos[i][0] for i in selected_idx]
     print(f"Selected indices: {selected_idx}")
     print(f"Selected seeds:   {selected_seeds}")
+    print(f"[TIME] selection = {time.time() - _t_sel0:.2f}s")
 
     # Write outputs: symlink (fall back to copy)
     rank_to_seed = {}
