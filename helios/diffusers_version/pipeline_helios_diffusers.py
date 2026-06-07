@@ -881,9 +881,24 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         zero_steps: int | None = 1,
         # ------------ DMD ------------
         is_amplify_first_chunk: bool = False,
+        # ------------ Progressive (chunk-wise resume) ------------
+        resume_state: dict | None = None,
+        num_chunks: int | None = None,
+        return_state: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
+
+        Progressive/chunk-wise generation (for progressive pruning):
+            - `num_chunks`: run only this many autoregressive chunks this call (default: all).
+            - `resume_state`: dict returned by a prior call (`return_state=True`) to CONTINUE
+              the autoregressive video from where it stopped, WITHOUT re-generating earlier
+              chunks. Restores `history_latents`, `image_latents`, `history_video`,
+              `total_generated_latent_frames`, and the next chunk index. Pass `image=None`
+              and the same `prompt_embeds`/`generator` on resume.
+            - `return_state=True`: also return the updated state dict so the caller can resume.
+              Return value becomes `(HeliosPipelineOutput, state)` (or `(video, state)` if
+              `return_dict=False`).
 
         Args:
             prompt (`str` or `list[str]`, *optional*):
@@ -1158,6 +1173,17 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         indices_latents_history_mid = indices_latents_history_mid.unsqueeze(0)
         indices_latents_history_long = indices_latents_history_long.unsqueeze(0)
 
+        # Chunk-wise resume: restore carried autoregressive state and pick the chunk range.
+        if resume_state is not None:
+            history_latents = resume_state["history_latents"]
+            image_latents = resume_state["image_latents"]
+            total_generated_latent_frames = resume_state["total_generated_latent_frames"]
+            history_video = resume_state["history_video"]
+            start_chunk = resume_state["next_chunk"]
+        else:
+            start_chunk = 0
+        end_chunk = num_latent_chunk if num_chunks is None else min(start_chunk + num_chunks, num_latent_chunk)
+
         # 6. Denoising loop
         if use_interpolate_prompt:
             if num_latent_chunk < max(interpolate_cumulative_list):
@@ -1181,7 +1207,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 self.scheduler.config.get("max_shift", 1.15),
             )
 
-        for k in range(num_latent_chunk):
+        for k in range(start_chunk, end_chunk):
             if use_interpolate_prompt:
                 assert num_latent_chunk >= max(interpolate_cumulative_list)
 
@@ -1353,7 +1379,18 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            return (video,)
+        state_out = None
+        if return_state:
+            state_out = {
+                "history_latents": history_latents,
+                "image_latents": image_latents,
+                "total_generated_latent_frames": total_generated_latent_frames,
+                "history_video": history_video,
+                "next_chunk": end_chunk,
+                "num_latent_chunk": num_latent_chunk,
+            }
 
-        return HeliosPipelineOutput(frames=video)
+        if not return_dict:
+            return (video, state_out) if return_state else (video,)
+
+        return (HeliosPipelineOutput(frames=video), state_out) if return_state else HeliosPipelineOutput(frames=video)
