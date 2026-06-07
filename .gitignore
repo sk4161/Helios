@@ -48,3 +48,4 @@ BestWishYSH
 *.txt
 *.png
 *.json
+.torchinductor_cache*/
